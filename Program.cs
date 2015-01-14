@@ -367,7 +367,7 @@ namespace S3Ldr
             Console.WriteLine(string.Format("{0}: Uploading \"{1}\" to s3.", DateTime.Now, content.OriginalPath));
             var sw = new Stopwatch();
             sw.Start();
-            if (content.Info.Length < (1024 * 1024 * 3))
+            if (content.Info.Length < (1024 * 1024 * 5) + 1)
             {
                 var r = new TransferUtilityUploadRequest()
                 {
@@ -394,7 +394,7 @@ namespace S3Ldr
         /// <returns></returns>
         internal static void DoMultiPartUpload(ContentInfo content, string key)
         {
-            var size = (1024 * 1024); // 1MB parts
+            var size = (5 * 1024 * 1024); // 5MB parts
             var count = content.Info.Length / size;
 
             var imr = new InitiateMultipartUploadRequest()
@@ -406,7 +406,7 @@ namespace S3Ldr
             if (content.IsCompressed) imr.Headers.ContentEncoding = "gzip";
             var mpu = tu.S3Client.InitiateMultipartUpload(imr);
 
-            var parts = Enumerable.Range(0, (int)count).Select(i => new UploadPartRequest()
+            var parts = Enumerable.Range(1, (int)count).Select(i => new UploadPartRequest()
             {
                 UploadId = mpu.UploadId,
                 FilePath = content.Info.FullName,
