@@ -18,7 +18,14 @@ using Amazon.S3.Transfer;
 namespace S3Ldr
 {
     [Flags]
-    public enum RemoteStatus { Unknown = 0, Missing = 1, Same = 2, Different = 4, Compressed = 8 };
+    public enum RemoteStatusEnum { Unknown = 0, Missing = 1, Same = 2, Different = 4 };
+
+    class RemoteStatus
+    {
+        public RemoteStatusEnum Existence { get; set; }
+        public string Hash { get; set; }
+        public bool IsCompressed { get; set; }
+    }
 
     class ContentInfo
     {
@@ -26,10 +33,19 @@ namespace S3Ldr
         public FileInfo Info { get; set; }
         public bool IsCompressed { get; set; }
         public string ContentType { get; set; }
+        public string SimpleHash { get; set; }
+        public string LargeFileHash { get; set; }
+        public bool SameHash(string hash)
+        {
+            hash = hash.Trim('"');
+            return string.Compare(hash, SimpleHash, StringComparison.OrdinalIgnoreCase) == 0
+                || string.Compare(hash, LargeFileHash, StringComparison.OrdinalIgnoreCase) == 0;
+        }
     }
 
     class Program
     {
+        const long AmazonPartSize = 5 * 1024 * 1024; // 5MB part size
         internal class Settings
         {
             internal Settings(string[] args)
@@ -116,6 +132,7 @@ namespace S3Ldr
                         Console.WriteLine(" - " + e);
                     Console.WriteLine("\nPlease correct the command arguments and try again.");
                 }
+                else Console.WriteLine("\nSomething failed(?), but I don't know what.");
             }
         }
 
@@ -200,13 +217,12 @@ namespace S3Ldr
                 .Where(a => !settings.IgnoreList.Any(ex => ex.IsMatch(a.path)));
 
             var prepared = filtered
-                .Select(a => new { a.path, content = Content(a.path) })
-                .Select(a => new { a.path, a.content, key = Key(a.path), hash = Hash(a.content.Info.FullName) }) // local calculations
-                .Select(a => new { a.path, a.content, a.key, a.hash, status = S3Status(a.key, a.hash), copyFrom = knownHashes.ContainsKey(a.hash) ? knownHashes[a.hash] : null }); // remote status
+                .Select(a => new { a.path, key = Key(a.path), content = Content(a.path) })
+                .Select(a => new { a.path, a.key, a.content, status = S3Status(a.key, a.content) }); // remote status
 
             var uploads = prepared
-                .Where(a => !a.status.HasFlag(RemoteStatus.Same))
-                .Select(a => MakeRemote(a.content, a.key, a.copyFrom));
+                .Where(a => !a.status.Existence.HasFlag(RemoteStatusEnum.Same))
+                .Select(a => MakeRemote(a.content, a.key));
 
             return uploads;
         }
@@ -237,11 +253,14 @@ namespace S3Ldr
                 content = zip;
                 gzip = true;
             }
+            var info = new FileInfo(content);
             return new ContentInfo()
             {
                 OriginalPath = path,
-                Info = new FileInfo(content),
-                IsCompressed = gzip
+                Info = info,
+                IsCompressed = gzip,
+                SimpleHash = SimpleHash(info),
+                LargeFileHash = info.Length > AmazonPartSize ? LargeFileHash(info) : null
             };
         }
 
@@ -320,25 +339,65 @@ namespace S3Ldr
 
         /// <summary>
         ///    Calculate the MD5 hash of the file contents so we can compare it to what's
-        ///    held in S3 as the object etag.
+        ///    held in S3 as the object etag.  For files larger than AmazonPartSize, use Amazon's method
+        ///    of combining MD5s for the parts and appending the part count.
         /// </summary>
         /// <param name="path"></param>
         /// <returns></returns>
-        public static string Hash(string path)
+        public static string SimpleHash(FileInfo info)
         {
             using (var md5 = MD5.Create())
             {
-                using (var f = File.OpenRead(path))
-                    return string.Join("", md5.ComputeHash(f).Select(b => b.ToString("X2")));
+                using (var f = info.OpenRead())
+                {
+                    var h = md5.ComputeHash(f);
+                    return string.Join("", h.Select(b => b.ToString("X2")));
+                }
             }
         }
-
+        /// <summary>
+        ///    For files larger than AmazonPartSize, use Amazon's method
+        ///    of combining MD5s for the parts and appending the part count.
+        /// </summary>
+        /// <param name="path"></param>
+        /// <returns></returns>
+        public static string LargeFileHash(FileInfo info)
+        {
+            var buf = new byte[AmazonPartSize];
+            using (var md5 = MD5.Create())
+            {
+                var count = (int)(info.Length / AmazonPartSize + 1);
+                var hashes = Enumerable.Range(0, count).Select(i =>
+                {
+                    using (var f = info.OpenRead())
+                    {
+                        f.Seek(i * AmazonPartSize, SeekOrigin.Begin);
+                        var c = f.Read(buf, 0, buf.Length);
+                        return md5.ComputeHash(buf, 0, c);
+                    }
+                }).ToArray();
+              
+                // the AWS S3 method
+                var combined = new byte[hashes.Sum(h => h.Length)];
+                int offset = 0;
+                foreach (var h in hashes)
+                {
+                    System.Buffer.BlockCopy(h, 0, combined, offset, h.Length);
+                    offset += h.Length;
+                }
+                var hash = md5.ComputeHash(combined);
+                return string.Join("", hash.Select(b => b.ToString("X2"))) + "-" + count;
+            }
+        }
         static Dictionary<string, string> knownHashes = new Dictionary<string, string>();
         static char[] quote = { '"' };
         static TransferUtility tu = new TransferUtility();
-        internal static RemoteStatus S3Status(string key, string hash)
+        internal static RemoteStatus S3Status(string key, ContentInfo content)
         {
-            var status = RemoteStatus.Unknown;
+            var rs = new RemoteStatus()
+            {
+                Existence = RemoteStatusEnum.Unknown,
+            };
             try
             {
                 var meta = tu.S3Client.GetObjectMetadata(new GetObjectMetadataRequest()
@@ -347,26 +406,29 @@ namespace S3Ldr
                     BucketName = settings.Bucket
                 });
 
-                status = string.Compare(meta.ETag.Trim(quote), hash, StringComparison.OrdinalIgnoreCase) == 0 ?
-                    RemoteStatus.Same
-                    : RemoteStatus.Different;
-                if (status == RemoteStatus.Same && !knownHashes.ContainsKey(hash))
-                    knownHashes.Add(hash, key);
+                rs.Hash = meta.ETag;
+                rs.Existence = content.SameHash(meta.ETag) ? RemoteStatusEnum.Same
+                    : RemoteStatusEnum.Different;
+
+                if (rs.Existence == RemoteStatusEnum.Same && !knownHashes.ContainsKey(content.SimpleHash))
+                    knownHashes.Add(content.SimpleHash, key);
+
                 if (meta.Metadata["Content-Encoding"] != null && meta.Metadata["Content-Encoding"].Contains("gzip"))
-                    status &= RemoteStatus.Compressed;
+                    rs.IsCompressed = true;
             }
             catch (AmazonS3Exception e)
             {
                 if (e.ErrorCode == "NotFound")
-                    status = RemoteStatus.Missing;
+                    rs.Existence = RemoteStatusEnum.Missing;
                 else throw new Exception("Can't get status from S3", e);
             }
-            Console.WriteLine(string.Format("{0}: The key \"{1}\" is {2} on s3.", DateTime.Now, key, status));
-            return status;
+            Console.WriteLine(string.Format("{0}: The key \"{1}\" is {2} on s3.", DateTime.Now, key, rs.Existence));
+            return rs;
         }
 
-        internal static TimeSpan MakeRemote(ContentInfo content, string key, string source)
+        internal static TimeSpan MakeRemote(ContentInfo content, string key)
         {
+            var source = knownHashes.ContainsKey(content.SimpleHash) ? knownHashes[content.SimpleHash] : null;
             return (source == null) ? DoUpload(content, key)
                 : DoCopy(content, key, source);
         }
@@ -384,11 +446,11 @@ namespace S3Ldr
 
         internal static TimeSpan DoUpload(ContentInfo content, string key)
         {
-            Console.WriteLine(string.Format("{0}: Uploading \"{1}\" to s3.", DateTime.Now, content.OriginalPath));
             var sw = new Stopwatch();
             sw.Start();
-            if (content.Info.Length < (1024 * 1024 * 5) + 1)
+            if (content.Info.Length <= AmazonPartSize)
             {
+                Console.WriteLine(string.Format("{0}: Uploading \"{1}\" to s3.", DateTime.Now, content.OriginalPath));
                 var r = new TransferUtilityUploadRequest()
                 {
                     BucketName = settings.Bucket,
@@ -399,6 +461,10 @@ namespace S3Ldr
                 if (content.IsCompressed)
                     r.Headers.ContentEncoding = "gzip";
                 tu.Upload(r);
+
+                // now that it's up there, re-use it
+                if (!knownHashes.ContainsKey(content.SimpleHash))
+                    knownHashes.Add(content.SimpleHash, key);
             }
             else DoMultiPartUpload(content, key);
             return sw.Elapsed;
@@ -414,8 +480,8 @@ namespace S3Ldr
         /// <returns></returns>
         internal static void DoMultiPartUpload(ContentInfo content, string key)
         {
-            var size = (5 * 1024 * 1024); // 5MB parts
-            var count = content.Info.Length / size;
+            Console.WriteLine(string.Format("{0}: Initiating multi-part upload of \"{1}\" to s3.", DateTime.Now, content.OriginalPath));
+            var count = (content.Info.Length / AmazonPartSize) + 1;
 
             var imr = new InitiateMultipartUploadRequest()
             {
@@ -426,21 +492,22 @@ namespace S3Ldr
             if (content.IsCompressed) imr.Headers.ContentEncoding = "gzip";
             var mpu = tu.S3Client.InitiateMultipartUpload(imr);
 
-            var parts = Enumerable.Range(1, (int)count).Select(i => new UploadPartRequest()
+            var parts = Enumerable.Range(0, (int)count).Select(i => new UploadPartRequest()
             {
                 UploadId = mpu.UploadId,
                 FilePath = content.Info.FullName,
                 BucketName = settings.Bucket,
                 Key = key,
-                PartNumber = i,
-                FilePosition = i * size,
-                PartSize = size
+                PartNumber = i + 1,
+                FilePosition = i * AmazonPartSize,
+                PartSize = Math.Min(AmazonPartSize, content.Info.Length - (i * AmazonPartSize))
             });
 
             var tasks = parts.Select(async p =>
             {
-                var atempt = 1;
-                while (atempt <= 3)
+                Console.WriteLine(string.Format("{0}: - Part #{1} of \"{2}\"...", DateTime.Now, p.PartNumber, content.OriginalPath));
+                var attempt = 1;
+                while (attempt <= 3)
                 {
                     try
                     {
@@ -449,8 +516,8 @@ namespace S3Ldr
                     catch (AmazonS3Exception ex)
                     {
                         Console.WriteLine(string.Format("{0}: Failed attempt #{1} to upload part {2} of file {3} with message: {4}.",
-                            DateTime.Now, atempt, p.PartNumber, content.Info.Name, ex.Message));
-                        atempt++;
+                            DateTime.Now, attempt, p.PartNumber, content.Info.Name, ex.Message));
+                        attempt++;
                     }
                     await Task.Delay(2000);
                 }
