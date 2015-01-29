@@ -202,11 +202,11 @@ namespace S3Ldr
             var prepared = filtered
                 .Select(a => new { a.path, content = Content(a.path) })
                 .Select(a => new { a.path, a.content, key = Key(a.path), hash = Hash(a.content.Info.FullName) }) // local calculations
-                .Select(a => new { a.path, a.content, a.key, a.hash, status = S3Status(a.key, a.hash) }); // remote status
+                .Select(a => new { a.path, a.content, a.key, a.hash, status = S3Status(a.key, a.hash), copyFrom = knownHashes.ContainsKey(a.hash) ? knownHashes[a.hash] : null }); // remote status
 
             var uploads = prepared
                 .Where(a => !a.status.HasFlag(RemoteStatus.Same))
-                .Select(a => DoUpload(a.content, a.key));
+                .Select(a => MakeRemote(a.content, a.key, a.copyFrom));
 
             return uploads;
         }
@@ -333,6 +333,7 @@ namespace S3Ldr
             }
         }
 
+        static Dictionary<string, string> knownHashes = new Dictionary<string, string>();
         static char[] quote = { '"' };
         static TransferUtility tu = new TransferUtility();
         internal static RemoteStatus S3Status(string key, string hash)
@@ -349,6 +350,8 @@ namespace S3Ldr
                 status = string.Compare(meta.ETag.Trim(quote), hash, StringComparison.OrdinalIgnoreCase) == 0 ?
                     RemoteStatus.Same
                     : RemoteStatus.Different;
+                if (status == RemoteStatus.Same && !knownHashes.ContainsKey(hash))
+                    knownHashes.Add(hash, key);
                 if (meta.Metadata["Content-Encoding"] != null && meta.Metadata["Content-Encoding"].Contains("gzip"))
                     status &= RemoteStatus.Compressed;
             }
@@ -360,6 +363,23 @@ namespace S3Ldr
             }
             Console.WriteLine(string.Format("{0}: The key \"{1}\" is {2} on s3.", DateTime.Now, key, status));
             return status;
+        }
+
+        internal static TimeSpan MakeRemote(ContentInfo content, string key, string source)
+        {
+            return (source == null) ? DoUpload(content, key)
+                : DoCopy(content, key, source);
+        }
+
+        internal static TimeSpan DoCopy(ContentInfo content, string key, string source)
+        {
+            Console.WriteLine(string.Format("{0}: Copying \"{1}\" from \"{2}\".", DateTime.Now, key, source));
+
+            var sw = new Stopwatch();
+            sw.Start();
+            tu.S3Client.CopyObject(settings.Bucket, source, settings.Bucket, key);
+            sw.Stop();
+            return sw.Elapsed;
         }
 
         internal static TimeSpan DoUpload(ContentInfo content, string key)
