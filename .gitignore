@@ -6,3 +6,5 @@
 /obj/Debug
 /packages
 *.suo
+/src/bin/Debug
+/src/obj/Debug
