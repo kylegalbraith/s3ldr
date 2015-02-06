@@ -13,6 +13,7 @@ using Amazon;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Amazon.S3.Transfer;
+using Newtonsoft.Json;
 
 // TODO: rename this app to S3up.exe?
 namespace S3Ldr
@@ -41,6 +42,7 @@ namespace S3Ldr
             return string.Compare(hash, SimpleHash, StringComparison.OrdinalIgnoreCase) == 0
                 || string.Compare(hash, LargeFileHash, StringComparison.OrdinalIgnoreCase) == 0;
         }
+        public IDictionary<string, string> Metadata { get; set; }
     }
 
     class Program
@@ -54,6 +56,7 @@ namespace S3Ldr
                 Bucket = args[0];
 
                 Direction = Settings.TxDirection.Upload;
+                AddFileSystemMeta = true;
 
                 Watch = args.Any(a => string.Compare(a, "/watch", StringComparison.OrdinalIgnoreCase) == 0);
                 Clear = args.Any(a => string.Compare(a, "/clear", StringComparison.OrdinalIgnoreCase) == 0);
@@ -80,6 +83,8 @@ namespace S3Ldr
 
             public string Bucket = "";
             public string Folder = ".";
+
+            public bool AddFileSystemMeta { get; set; }
 
             public TxDirection Direction { get; set; }
 
@@ -232,6 +237,21 @@ namespace S3Ldr
             var content = path;
             var gzip = false;
 
+            var file = new FileInfo(path);
+            var meta = settings.AddFileSystemMeta ? new Dictionary<string, string>() {
+                { "createdUtc", file.CreationTimeUtc.ToString() },
+                { "accessedUtc", file.LastAccessTimeUtc.ToString() },
+                { "modifiedUtc", file.LastWriteTimeUtc.ToString() },
+                { "fullname", file.FullName},
+                { "archive", file.Attributes.HasFlag(FileAttributes.Archive).ToString() },
+                { "compressed", file.Attributes.HasFlag(FileAttributes.Compressed).ToString() },
+                { "encrypted", file.Attributes.HasFlag(FileAttributes.Encrypted).ToString() },
+                { "hidden", file.Attributes.HasFlag(FileAttributes.Hidden).ToString() },
+                { "readonly", file.Attributes.HasFlag(FileAttributes.ReadOnly).ToString() },
+                { "reparsepoint", file.Attributes.HasFlag(FileAttributes.ReparsePoint).ToString() },
+                { "system", file.Attributes.HasFlag(FileAttributes.System).ToString() }
+            } : new Dictionary<string, string>();
+
             if (settings.MinList.Any(m => m.IsMatch(path)))
             {
                 var min = Path.Combine(settings.TempFolder, "Minify", path);
@@ -260,7 +280,8 @@ namespace S3Ldr
                 Info = info,
                 IsCompressed = gzip,
                 SimpleHash = SimpleHash(info),
-                LargeFileHash = info.Length > AmazonPartSize ? LargeFileHash(info) : null
+                LargeFileHash = info.Length > AmazonPartSize ? LargeFileHash(info) : null,
+                Metadata = meta
             };
         }
 
@@ -309,8 +330,8 @@ namespace S3Ldr
 
         private static void DeMinify(string from, string to)
         {
-            // .json
-            // JsonConvert.SerializeObject(jsonString, Formatting.Indented);
+            File.WriteAllText(to, JsonConvert.SerializeObject(
+                JsonConvert.DeserializeObject(File.ReadAllText(from)), Formatting.Indented));
         }
 
         private static void Compress(string from, string to)
@@ -376,7 +397,7 @@ namespace S3Ldr
                         return md5.ComputeHash(buf, 0, c);
                     }
                 }).ToArray();
-              
+
                 // the AWS S3 method
                 var combined = new byte[hashes.Sum(h => h.Length)];
                 int offset = 0;
@@ -439,6 +460,16 @@ namespace S3Ldr
 
             var sw = new Stopwatch();
             sw.Start();
+            var cp = new CopyObjectRequest()
+            {
+                SourceBucket = settings.Bucket,
+                DestinationBucket = settings.Bucket,
+                SourceKey = source,
+                DestinationKey = key,
+                MetadataDirective = S3MetadataDirective.REPLACE
+            };
+            foreach (var kv in content.Metadata)
+                cp.Metadata.Add(kv.Key, kv.Value);
             tu.S3Client.CopyObject(settings.Bucket, source, settings.Bucket, key);
             sw.Stop();
             return sw.Elapsed;
@@ -458,6 +489,8 @@ namespace S3Ldr
                     FilePath = content.Info.FullName,
                     ContentType = content.ContentType
                 };
+                foreach (var kv in content.Metadata)
+                    r.Metadata.Add("x-amz-meta-" + kv.Key, kv.Value); // just to be clear about the prefix
                 if (content.IsCompressed)
                     r.Headers.ContentEncoding = "gzip";
                 tu.Upload(r);
@@ -489,7 +522,10 @@ namespace S3Ldr
                 BucketName = settings.Bucket,
                 CannedACL = S3CannedACL.PublicRead
             };
-            if (content.IsCompressed) imr.Headers.ContentEncoding = "gzip";
+            foreach (var kv in content.Metadata)
+                imr.Metadata.Add("x-amz-meta-" + kv.Key, kv.Value); // just to be clear about the prefix            
+            if (content.IsCompressed)
+                imr.Headers.ContentEncoding = "gzip";
             var mpu = tu.S3Client.InitiateMultipartUpload(imr);
 
             var parts = Enumerable.Range(0, (int)count).Select(i => new UploadPartRequest()
