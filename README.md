@@ -3,4 +3,4 @@ Command-line tool for uploading and downloading content from an Amazon S3 bucket
 ### Usage
 Default behaviour is to upload from the current directory to the destination bucket location
 
-s3ldr [options][source] destination_bucket
+s3ldr *[options][source]* destination_bucket
