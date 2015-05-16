@@ -53,7 +53,8 @@ namespace S3Ldr
             internal Settings(string[] args)
             {
                 Folder = System.Environment.CurrentDirectory;
-                Bucket = args[0];
+                //bucket should be the last command line argument
+                Bucket = args[args.Length-1];
 
                 Direction = Settings.TxDirection.Upload;
                 AddFileSystemMeta = true;

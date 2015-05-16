@@ -4,7 +4,8 @@
 
 /bin/Debug
 /obj/Debug
-/packages
+/src/packages
 *.suo
 /src/bin/Debug
 /src/obj/Debug
+*.user
